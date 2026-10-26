@@ -1,0 +1,9 @@
+{
+  "name": "void-survivors-relay",
+  "version": "1.0.0",
+  "description": "Room relay for Void Survivors (co-op and PvP over the internet)",
+  "main": "server.js",
+  "scripts": { "start": "node server.js", "test": "node test.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": { "ws": "8.18.0" }
+}
