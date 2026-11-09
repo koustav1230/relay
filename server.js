@@ -7,27 +7,31 @@ const { WebSocketServer } = require('ws');
 
 const NAME = /^[a-z0-9][a-z0-9_.-]{0,47}$/, TOPIC = /^[a-z][a-z0-9_.-]{0,47}$/;
 function createRelay(opt = {}) {
-  const O = Object.assign({ maxRooms: 400, maxPerIp: 12, roomSize: 10, createPerMin: 12, origins: [], trustProxy: false, maxPayload: 24 * 1024 }, opt);
-  const rooms = new Map(), perIp = new Map(), creates = new Map(), dirty = new Set();
+  const O = Object.assign({ maxRooms: 400, maxPerIp: 30, idleMs: 60000, roomSize: 10, createPerMin: 12, origins: [], trustProxy: false, maxPayload: 24 * 1024 }, opt);
+  const rooms = new Map(), perIp = new Map(), creates = new Map(), dirty = new Set(), socks = new Map();   // socks: ip -> Set of sockets (so leaked, room-less ones can be dropped)
   const stats = { started: Date.now(), joins: 0, creates: 0, rejects: 0, msgs: 0 };
   const ipOf = (req) => { if (O.trustProxy) { const f = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim(); if (f) return f; } return req.socket.remoteAddress || '?'; };
   const server = http.createServer((req, res) => {
     const h = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' };
     if (req.method === 'OPTIONS') { res.writeHead(204, h); return res.end(); }
-    if (req.url === '/' || req.url.startsWith('/health')) { let clients = 0; for (const r of rooms.values()) clients += r.size; res.writeHead(200, h); return res.end(JSON.stringify({ ok: true, svc: 'vs-relay', v: 1, rooms: rooms.size, clients, up: Math.round((Date.now() - stats.started) / 1000) })); }
+    if (req.url === '/' || req.url.startsWith('/health')) { let clients = 0; for (const r of rooms.values()) clients += r.size; res.writeHead(200, h); return res.end(JSON.stringify({ ok: true, svc: 'vs-relay', v: 1, sockets: wss.clients.size, evicted: stats.evicted || 0, rooms: rooms.size, clients, up: Math.round((Date.now() - stats.started) / 1000) })); }
     res.writeHead(404, h); res.end('{"ok":false}');
   });
   const wss = new WebSocketServer({ server, path: '/ws', maxPayload: O.maxPayload, verifyClient: (info, cb) => {
     const ip = ipOf(info.req); const o = info.origin || '';
     if (O.origins.length && o && !O.origins.some((a) => o === a || o.endsWith(a.replace(/^\*/, '')))) { stats.rejects++; return cb(false, 403, 'origin'); }
-    if ((perIp.get(ip) || 0) >= O.maxPerIp) { stats.rejects++; return cb(false, 429, 'too many connections'); }
+    if ((perIp.get(ip) || 0) >= O.maxPerIp) {   // a crowded address (a school, a phone network, or leaked connections): free up the oldest socket that is not in any room instead of refusing
+      let victim = null; for (const w of socks.get(ip) || []) if (!w.rc.size && (!victim || w.born < victim.born)) victim = w;
+      if (!victim) { stats.rejects++; return cb(false, 429, 'too many connections'); }
+      stats.evicted = (stats.evicted || 0) + 1; victim.terminate();
+    }
     cb(true);
   } });
   const send = (ws, o) => { if (ws.readyState === 1) ws.send(JSON.stringify(o)); };
   function leaveRoom(c, name) { const r = rooms.get(name); if (!r) return; r.delete(c.id); c.rooms.delete(name); if (!r.size) rooms.delete(name); else dirty.add(name); }
   wss.on('connection', (ws, req) => {
     const ip = ipOf(req); perIp.set(ip, (perIp.get(ip) || 0) + 1);
-    const c = { id: crypto.randomBytes(6).toString('hex'), rooms: new Set(), alive: true }; ws.isAlive = true; ws.on('pong', () => { ws.isAlive = true; });
+    const c = { id: crypto.randomBytes(6).toString('hex'), rooms: new Set(), alive: true }; ws.rc = c.rooms; ws.born = Date.now(); ws.ip = ip; if (!socks.has(ip)) socks.set(ip, new Set()); socks.get(ip).add(ws); ws.isAlive = true; ws.on('pong', () => { ws.isAlive = true; });
     send(ws, { t: 'hi', id: c.id });
     let win = Date.now(), cnt = 0;
     ws.on('message', (raw) => {
@@ -64,7 +68,7 @@ function createRelay(opt = {}) {
         dirty.add(m.room);
       }
     });
-    ws.on('close', () => { for (const n of [...c.rooms]) leaveRoom(c, n); const n = (perIp.get(ip) || 1) - 1; if (n <= 0) perIp.delete(ip); else perIp.set(ip, n); });
+    ws.on('close', () => { for (const n of [...c.rooms]) leaveRoom(c, n); const n = (perIp.get(ip) || 1) - 1; if (n <= 0) perIp.delete(ip); else perIp.set(ip, n); const st = socks.get(ip); if (st) { st.delete(ws); if (!st.size) socks.delete(ip); } });
     ws.on('error', () => {});
   });
   const tick = setInterval(() => {
@@ -72,15 +76,18 @@ function createRelay(opt = {}) {
     dirty.clear();
   }, 33);
   const beat = setInterval(() => {   // drop dead connections and keep proxies from closing quiet ones
-    for (const ws of wss.clients) { if (ws.isAlive === false) { ws.terminate(); continue; } ws.isAlive = false; try { ws.ping(); } catch {} }
+    const now = Date.now();
+    for (const ws of wss.clients) { if (ws.isAlive === false || (!ws.rc.size && now - ws.born > O.idleMs)) { ws.terminate(); continue; } ws.isAlive = false; try { ws.ping(); } catch {} }   // dead links, and sockets that never joined a room (leaked by an old client)
     const mins = Math.floor(Date.now() / 60000); for (const k of creates.keys()) if (!k.endsWith(':' + mins)) creates.delete(k);
-  }, 25000);
+  }, O.beatMs || 25000);
   return { server, wss, rooms, stats, close() { clearInterval(tick); clearInterval(beat); for (const ws of wss.clients) ws.terminate(); wss.close(); server.close(); } };
 }
 module.exports = { createRelay };
 if (require.main === module) {
   const origins = String(process.env.ALLOWED_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean);
-  const r = createRelay({ origins, trustProxy: process.env.TRUST_PROXY === '1' || !!process.env.RENDER, maxRooms: +process.env.MAX_ROOMS || 400, maxPerIp: +process.env.MAX_PER_IP || 12 });
+  const r = createRelay({ origins, trustProxy: process.env.TRUST_PROXY === '1' || !!process.env.RENDER, maxRooms: +process.env.MAX_ROOMS || 400, maxPerIp: +process.env.MAX_PER_IP || 30 });
   const port = +process.env.PORT || 8790;
+  r.server.keepAliveTimeout = 65000; r.server.headersTimeout = 66000;   // longer than the proxy's idle timeout, so reused connections are not cut mid-request
+  process.on('unhandledRejection', (e) => console.error('[relay] unhandled', e)); process.on('uncaughtException', (e) => { console.error('[relay] fatal', e); process.exit(1); });
   r.server.listen(port, () => console.log('vs-relay listening on ' + port + (origins.length ? ' · origins: ' + origins.join(', ') : ' · any origin')));
 }
